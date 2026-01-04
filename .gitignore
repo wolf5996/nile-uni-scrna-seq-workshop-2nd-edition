@@ -1,0 +1,93 @@
+# ================================
+# Universal .gitignore for R Projects
+# ================================
+
+# --- RStudio & R session files ---
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+.Rprofile
+.Renviron
+
+# --- renv (R package management) ---
+renv/library/
+renv/staging/
+renv/profiles/
+# keep lockfile tracked for reproducibility
+!renv.lock
+
+# --- Quarto / RMarkdown intermediate outputs ---
+*.utf8.md
+*.knit.md
+*.nb.html
+*.pdf
+*.docx
+.quarto/
+.Rcheck/
+*_cache/
+cache/
+.knitr_cache/
+
+# --- Project data & results (always ignored) ---
+data/
+read/
+write/
+results/
+checkpoints/
+output/
+logs/
+tmp/
+context/
+
+# --- Common large data formats (bioinformatics aware) ---
+*.rds
+*.qs
+*.feather
+*.fst
+*.parquet
+*.h5
+*.h5ad
+*.bam
+*.sam
+*.cram
+*.bai
+*.crai
+*.fastq*
+*.fq
+*.vcf*
+*.bed
+*.gtf
+*.gff
+*.gz
+*.zip
+*.tar
+*.tar.gz
+
+# --- Figures / images (auto-generated) ---
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.tiff
+
+# --- OS / IDE noise ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
+*~
+.vscode/
+.idea/
+
+# --- Python cache (if using reticulate) ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ================================
+# End of template
+# ================================

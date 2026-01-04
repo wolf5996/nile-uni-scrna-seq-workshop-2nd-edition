@@ -1,0 +1,759 @@
+---
+title: "01-Single-Cell RNA-Seq Analysis: QC & Pre-Processing"
+author: "Dr Badran Elshenawy"
+date: "January 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: darkly
+    self-contained: true
+    title-block-banner: true
+execute:
+  warning: false
+  message: false
+---
+
+# Package Installation
+
+-   `Seurat` is the state-of-the-art package for single-cell RNA-seq analysis in R
+-   `SeuratData` provides curated datasets for learning and testing, including the ifnb dataset we'll use
+-   `tidyverse` enables efficient data manipulation and visualization
+-   `scater` provides additional QC metrics and utilities
+-   `clustree` helps visualize clustering results across different resolutions
+-   `BadranSeq` provides publication-ready visualizations for single-cell data
+
+```{r install-packages, eval=FALSE}
+# install BiocManager if not already installed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# install CRAN packages
+install.packages(c(
+  "tidyverse",
+  "Seurat",
+  "clustree",
+  "remotes",
+  "devtools"
+))
+
+# install SeuratData for example datasets
+remotes::install_github("satijalab/seurat-data")
+
+# install BadranSeq for publication-ready visualizations
+devtools::install_github("wolf5996/BadranSeq")
+
+# install Bioconductor packages
+BiocManager::install(c("scater", "SingleCellExperiment"))
+```
+
+# Directory Structure
+
+-   organizing project files into clear subdirectories makes analyses reproducible and shareable
+-   `read/` stores input data files (raw counts, annotations, metadata)
+-   `write/` stores output files, further organized into `figures/` and `tables/`
+-   `scripts/` contains analysis code (this file lives here)
+-   `checkpoints/` stores intermediate Seurat objects for long-running analyses
+-   using `dir.create()` with `showWarnings = FALSE` safely creates directories that may already exist
+
+```{r setup-directories}
+# create directory structure (safe to run even if directories exist)
+dir.create("../read", showWarnings = FALSE)
+dir.create("../write", showWarnings = FALSE)
+dir.create("../write/figures", showWarnings = FALSE)
+dir.create("../write/tables", showWarnings = FALSE)
+dir.create("../checkpoints", showWarnings = FALSE)
+```
+
+------------------------------------------------------------------------
+
+# Introduction
+
+-   in this practical session, we will analyse single-cell RNA-seq data using the Seurat pipeline
+-   we will use the **ifnb** dataset from SeuratData: human PBMCs comparing control vs interferon-beta stimulated cells
+-   this dataset is ideal for learning the standard scRNA-seq workflow and differential expression analysis
+
+## Loading Packages
+
+```{r load-packages}
+library(tidyverse)
+library(Seurat)
+library(SeuratData)
+library(scater)
+library(clustree)
+library(magrittr)
+```
+
+## Handling Package Conflicts
+
+-   `dplyr::filter()` conflicts with `stats::filter()` from base R
+-   `dplyr::select()` conflicts with other packages
+-   using explicit namespacing (`dplyr::filter()`) prevents unexpected behavior
+
+```{r conflict-setup}
+library(conflicted)
+
+# set dplyr as the default for common conflicts
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::select)
+
+# resolve other conflicts
+conflicts_prefer(base::setdiff)
+```
+
+------------------------------------------------------------------------
+
+# Overview of the scRNA-Seq Pipeline
+
+-   **Quality Control (QC):** filter out low-quality cells and uninformative genes
+    -   cell QC uses library size and detected features
+    -   gene QC removes features with very low expression across cells
+-   **Normalization:** adjust counts for differences in library size between cells
+-   **Variable Feature Selection:** identify genes driving biological variation
+-   **Scaling:** center and scale data for dimensionality reduction
+-   **Dimensionality Reduction:** PCA followed by UMAP for visualization
+-   **Clustering:** group cells with similar transcriptional profiles
+
+## Recommended Resources
+
+-   [Seurat official tutorials](https://satijalab.org/seurat/)
+-   [OSCA book](https://bioconductor.org/books/release/OSCA/) - comprehensive single-cell analysis guide
+-   [Single Cell Best Practices](https://www.sc-best-practices.org/) - community best practices
+
+------------------------------------------------------------------------
+
+# 1. Data Import
+
+-   the ifnb dataset contains human PBMCs from control and IFN-beta stimulated conditions
+-   `InstallData()` downloads the dataset; `LoadData()` loads it into a Seurat object
+-   the data comes pre-annotated with cell type labels for exploration
+
+```{r data-import}
+# install and load the ifnb dataset
+InstallData("ifnb")
+data("ifnb")
+
+# update to current seurat object format (required for SeuratData datasets)
+ifnb <- UpdateSeuratObject(ifnb)
+
+# explore the dataset structure
+ifnb
+```
+
+-   let's examine the metadata to understand the experimental design
+
+```{r explore-metadata}
+# view metadata columns
+head(ifnb@meta.data)
+
+# check experimental conditions
+table(ifnb$stim)
+
+# check cell type annotations (pre-computed in this dataset)
+table(ifnb$seurat_annotations)
+```
+
+------------------------------------------------------------------------
+
+# 2. Quality Control
+
+-   QC is the first and most critical step in any scRNA-seq pipeline
+-   poor QC leads to misleading biological conclusions
+-   we assess two core metrics per cell: library size and detected features
+
+## 2.1 Library Size Distribution
+
+-   cells with very low library size may represent empty droplets or debris
+-   cells with very high library size may represent doublets (two cells in one droplet)
+-   MAD (median absolute deviation) helps set data-driven thresholds
+
+```{r qc-library-size}
+library(ggplot2)
+library(magrittr)
+
+# violin plot by condition
+VlnPlot(
+  ifnb,
+  features = "nCount_RNA",
+  group.by = "stim",
+  pt.size = 0.1
+) +
+  labs(title = "Library Size by Condition") +
+  theme_minimal()
+
+ggsave(
+  "../write/figures/library_size_violin.png",
+  width = 8,
+  height = 6
+)
+
+# calculate MAD thresholds
+outlier_counts <- isOutlier(
+  ifnb@meta.data$nCount_RNA,
+  nmads = 3,
+  log = TRUE
+)
+counts_thresholds <- attr(outlier_counts, "thresholds")
+
+# histogram with thresholds
+ifnb@meta.data %>%
+  ggplot(aes(x = nCount_RNA)) +
+  geom_histogram(
+    aes(fill = stim),
+    bins = 50,
+    alpha = 0.7
+  ) +
+  facet_wrap(~stim, ncol = 1) +
+  geom_vline(
+    xintercept = counts_thresholds,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  labs(
+    x = "Library Size",
+    y = "Frequency",
+    title = "Library Size Distribution"
+  ) +
+  theme_minimal() +
+  scale_x_log10()
+
+ggsave(
+  "../write/figures/library_size_histogram.png",
+  width = 8,
+  height = 6
+)
+```
+
+## 2.2 Detected Features Distribution
+
+-   cells with very few detected genes may be low-quality or empty
+-   cells with very many detected genes may be doublets
+-   typically correlates with library size
+
+```{r qc-features}
+# violin plot
+VlnPlot(
+  ifnb,
+  features = "nFeature_RNA",
+  group.by = "stim",
+  pt.size = 0.1
+) +
+  labs(title = "Detected Features by Condition") +
+  theme_minimal()
+
+ggsave(
+  "../write/figures/detected_features_violin.png",
+  width = 8,
+  height = 6
+)
+
+# calculate MAD thresholds
+outlier_features <- isOutlier(
+  ifnb@meta.data$nFeature_RNA,
+  nmads = 3,
+  log = TRUE
+)
+features_thresholds <- attr(outlier_features, "thresholds")
+
+# histogram with thresholds
+ifnb@meta.data %>%
+  ggplot(aes(x = nFeature_RNA)) +
+  geom_histogram(
+    aes(fill = stim),
+    bins = 50,
+    alpha = 0.7
+  ) +
+  facet_wrap(~stim, ncol = 1) +
+  geom_vline(
+    xintercept = features_thresholds,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  labs(
+    x = "Detected Features",
+    y = "Frequency",
+    title = "Detected Features Distribution"
+  ) +
+  theme_minimal()
+
+ggsave(
+  "../write/figures/detected_features_histogram.png",
+  width = 8,
+  height = 6
+)
+```
+
+## 2.3 Combined QC Visualization
+
+-   plotting QC metrics together reveals relationships between them
+-   helps identify if thresholds are too stringent or too lenient
+-   color by condition to compare distributions
+
+```{r qc-combined}
+# scatter plot combining QC metrics
+ifnb@meta.data %>%
+  ggplot(aes(
+    x = nCount_RNA,
+    y = nFeature_RNA,
+    color = stim
+  )) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  facet_wrap(~stim) +
+  geom_vline(
+    xintercept = counts_thresholds,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  geom_hline(
+    yintercept = features_thresholds,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  labs(
+    x = "Library Size",
+    y = "Detected Features",
+    title = "Combined QC Metrics"
+  ) +
+  theme_minimal() +
+  scale_x_log10()
+
+ggsave(
+  "../write/figures/qc_combined_scatter.png",
+  width = 10,
+  height = 5
+)
+```
+
+## 2.4 Cell Filtering
+
+-   apply QC filters to remove low-quality cells
+-   document how many cells are removed at each step
+-   be conservative: removing too many cells loses biological signal
+
+```{r cell-filtering}
+# number of cells before filtering
+ncol(ifnb)
+
+# apply filters
+ifnb_filtered <- subset(
+  ifnb,
+  subset = (nCount_RNA > counts_thresholds[1]) &
+           (nCount_RNA < counts_thresholds[2]) &
+           (nFeature_RNA > features_thresholds[1]) &
+           (nFeature_RNA < features_thresholds[2])
+)
+
+# number of cells after filtering
+ncol(ifnb_filtered)
+
+# percentage of cells retained
+paste0(round(ncol(ifnb_filtered) / ncol(ifnb) * 100, 1), "% of cells retained")
+```
+
+## 2.5 Gene Filtering
+
+-   remove genes expressed in very few cells
+-   these genes add noise without contributing biological signal
+-   typical threshold: expressed in at least 3 cells
+
+```{r gene-filtering}
+# number of genes before filtering
+nrow(ifnb_filtered)
+
+# filter genes expressed in at least 3 cells
+counts <- GetAssayData(ifnb_filtered, slot = "counts")
+gene_filter <- rowSums(counts > 0) >= 3
+ifnb_filtered <- ifnb_filtered[gene_filter, ]
+
+# number of genes after filtering
+nrow(ifnb_filtered)
+```
+
+------------------------------------------------------------------------
+
+# 3. Normalization and Variable Feature Selection
+
+-   normalization adjusts for differences in sequencing depth between cells
+-   SCTransform is the recommended method: normalizes, finds variable features, and scales in one step
+-   variable features are genes with highest cell-to-cell variation and drive clustering
+
+```{r normalization}
+# SCTransform normalization (this may take a few minutes)
+ifnb_filtered <- SCTransform(ifnb_filtered, verbose = FALSE)
+
+# check that SCT assay is now active
+DefaultAssay(ifnb_filtered)
+```
+
+-   visualize the most variable features
+
+```{r variable-features}
+# identify top variable features
+top_features <- head(VariableFeatures(ifnb_filtered), 20)
+
+# plot variable features
+VariableFeaturePlot(ifnb_filtered) +
+  theme_minimal()
+
+ggsave(
+  "../write/figures/variable_features.png",
+  width = 8,
+  height = 6
+)
+
+# label top features
+LabelPoints(
+  plot = VariableFeaturePlot(ifnb_filtered),
+  points = top_features,
+  repel = TRUE
+) +
+  theme_minimal()
+
+ggsave(
+  "../write/figures/variable_features_labeled.png",
+  width = 10,
+  height = 8
+)
+```
+
+------------------------------------------------------------------------
+
+# 4. Dimensionality Reduction
+
+-   high-dimensional gene expression data is reduced to key components
+-   PCA captures linear combinations of genes explaining most variance
+-   UMAP provides non-linear visualization for exploring cell populations
+
+## 4.1 Principal Component Analysis (PCA)
+
+-   PCA is essential for denoising and as input to UMAP and clustering
+-   first PCs capture biological variation; later PCs capture noise
+-   examining PC loadings reveals genes driving each component
+
+```{r pca, fig.width=12, fig.height=10}
+# run PCA
+ifnb_filtered <- RunPCA(ifnb_filtered, verbose = FALSE)
+
+# visualize PCA colored by condition using BadranSeq
+BadranSeq::do_PcaPlot(
+  ifnb_filtered,
+  group.by = "stim",
+  plot.title = "PCA by Condition"
+)
+
+
+ggsave(
+  "../write/figures/pca_condition.png",
+  width = 12,
+  height = 10
+)
+
+# visualize PCA colored by cell type using BadranSeq
+BadranSeq::do_PcaPlot(
+  ifnb_filtered,
+  group.by = "seurat_annotations",
+  plot.title = "PCA by Cell Type"
+)
+
+ggsave(
+  "../write/figures/pca_celltype.png",
+  width = 12,
+  height = 10
+)
+```
+
+## 4.2 Elbow Plot
+
+-   determine how many PCs to use for downstream analysis
+-   look for the "elbow" where additional PCs explain little variance
+-   typically 10-30 PCs are used
+
+```{r elbow-plot}
+# elbow plot
+BadranSeq::EnhancedElbowPlot(
+  object = ifnb_filtered
+)
+ggsave(
+  "../write/figures/elbow_plot.png",
+  width = 8,
+  height = 6
+)
+
+# set number of PCs to use
+pcs_use <- 1:20
+```
+
+## 4.3 UMAP
+
+-   UMAP provides 2D visualization of high-dimensional data
+-   uses PCA as input for efficiency
+-   preserves local and some global structure
+
+```{r umap, fig.width=12, fig.height=10}
+# run UMAP
+ifnb_filtered <- RunUMAP(
+  ifnb_filtered,
+  dims = pcs_use,
+  verbose = FALSE
+)
+
+# visualize by condition using BadranSeq
+BadranSeq::do_UmapPlot(
+  ifnb_filtered,
+  group.by = "stim",
+  plot.title = "UMAP by Condition"
+)
+
+ggsave(
+  "../write/figures/umap_condition.png",
+  width = 12,
+  height = 10
+)
+
+# visualize by cell type using BadranSeq
+BadranSeq::do_UmapPlot(
+  ifnb_filtered,
+  group.by = "seurat_annotations",
+  label = TRUE,
+  plot.title = "UMAP by Cell Type"
+)
+
+ggsave(
+  "../write/figures/umap_celltype.png",
+  width = 12,
+  height = 10
+)
+```
+
+------------------------------------------------------------------------
+
+# 5. Clustering
+
+-   clustering groups cells with similar transcriptional profiles
+-   Seurat uses graph-based clustering (Louvain or Leiden algorithm)
+-   resolution parameter controls granularity: higher = more clusters
+
+## 5.1 Finding Neighbors and Clusters
+
+-   `FindNeighbors()` constructs a KNN graph based on PCA
+-   `FindClusters()` applies community detection to identify clusters
+-   test multiple resolutions to find optimal clustering
+
+```{r clustering}
+# find neighbors
+ifnb_filtered <- FindNeighbors(
+  ifnb_filtered,
+  dims = pcs_use,
+  verbose = FALSE
+)
+
+# find clusters at multiple resolutions
+for (res in seq(0.1, 1.0, 0.1)) {
+  ifnb_filtered <- FindClusters(
+    ifnb_filtered,
+    resolution = res,
+    verbose = FALSE
+  )
+}
+```
+
+## 5.2 Clustering Trees
+
+-   clustering trees show how clusters split at different resolutions
+-   helps identify stable clusters vs artifacts of over-clustering
+-   SC3 stability index indicates how robust each cluster is
+
+```{r clustree, fig.width=14, fig.height=12}
+# clustering tree
+clustree(ifnb_filtered) +
+  theme(legend.position = "bottom")
+
+ggsave(
+  "../write/figures/clustree.png",
+  width = 14,
+  height = 12
+)
+
+# clustering tree with stability
+clustree(
+  ifnb_filtered,
+  node_colour = "sc3_stability"
+) +
+  scale_color_viridis_c(option = "B") +
+  theme(legend.position = "bottom")
+
+ggsave(
+  "../write/figures/clustree_stability.png",
+  width = 14,
+  height = 12
+)
+```
+
+## 5.3 Final Clustering
+
+-   select resolution based on clustering tree and biological knowledge
+-   visualize clusters on UMAP
+
+```{r final-clustering, fig.width=12, fig.height=10}
+# set final clustering resolution
+ifnb_filtered <- FindClusters(
+  ifnb_filtered,
+  resolution = 0.5,
+  verbose = FALSE
+)
+
+# visualize clusters using BadranSeq
+BadranSeq::do_UmapPlot(
+  ifnb_filtered,
+  label = TRUE,
+  plot.title = "UMAP with Clusters (resolution = 0.5)",
+  group.by = "seurat_clusters"
+)
+
+ggsave(
+  "../write/figures/umap_clusters.png",
+  width = 12,
+  height = 10
+)
+
+# compare clusters to known cell types using BadranSeq
+BadranSeq::do_UmapPlot(
+  ifnb_filtered,
+  group.by = "seurat_annotations",
+  label = TRUE,
+  plot.title = "UMAP with Cell Type Annotations"
+)
+
+ggsave(
+  "../write/figures/umap_annotations.png",
+  width = 12,
+  height = 10
+)
+```
+
+------------------------------------------------------------------------
+
+# 6. Feature Visualization
+
+-   feature plots show expression of specific genes across cells
+-   violin plots compare expression between groups
+-   useful for exploring marker genes and biological hypotheses
+
+## 6.1 Feature Plots
+
+-   visualize expression of known marker genes
+-   ISG15 and IFI6 are interferon-stimulated genes expected to be upregulated in STIM
+
+```{r feature-plots}
+# interferon-stimulated genes
+FeaturePlot(
+  ifnb_filtered,
+  features = c("ISG15", "IFI6", "IFIT1", "IFIT3"),
+  ncol = 2
+) &
+  scale_color_viridis_c(
+    option = "B",
+    direction = -1
+  ) &
+  theme_minimal()
+
+ggsave(
+  "../write/figures/feature_plot_ifn_genes.png",
+  width = 10,
+  height = 10
+)
+
+# cell type markers
+FeaturePlot(
+  ifnb_filtered,
+  features = c("CD3D", "CD14", "MS4A1", "GNLY"),
+  ncol = 2
+) &
+  scale_color_viridis_c(
+    option = "B",
+    direction = -1
+  ) &
+  theme_minimal()
+
+ggsave(
+  "../write/figures/feature_plot_markers.png",
+  width = 10,
+  height = 10
+)
+```
+
+## 6.2 Violin Plots
+
+-   compare expression between conditions or clusters
+-   shows distribution of expression values
+
+```{r violin-plots}
+# compare ISG expression between conditions
+VlnPlot(
+  ifnb_filtered,
+  features = c("ISG15", "IFI6", "IFIT1", "IFIT3"),
+  group.by = "stim",
+  ncol = 2,
+  pt.size = 0
+) &
+  theme_minimal()
+
+ggsave(
+  "../write/figures/violin_ifn_genes.png",
+  width = 10,
+  height = 8
+)
+```
+
+------------------------------------------------------------------------
+
+# 7. Saving Results
+
+-   save the processed Seurat object for future use
+-   checkpoints allow resuming analysis without reprocessing
+-   using compression reduces file size significantly
+
+```{r save-results}
+# save processed Seurat object with compression
+write_rds(
+  ifnb_filtered,
+  "../checkpoints/ifnb_processed.rds",
+  compress = "gz"
+)
+
+# to load later:
+# ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+```
+
+------------------------------------------------------------------------
+
+# Summary
+
+-   we processed the ifnb dataset through the standard scRNA-seq QC and pre-processing pipeline
+-   QC filtering removed low-quality cells while retaining biological signal
+-   SCTransform normalization prepared data for downstream analysis
+-   PCA and UMAP revealed clear separation between conditions and cell types
+-   clustering identified distinct cell populations
+-   the processed object is saved for differential expression and pathway analysis in the next module
+
+| Step | Key Functions |
+|-----------------|-------------------------------------------------------|
+| QC | `isOutlier()`, `subset()` |
+| Normalization | `SCTransform()` |
+| Dim Reduction | `RunPCA()`, `RunUMAP()` |
+| Clustering | `FindNeighbors()`, `FindClusters()` |
+| Visualization | `BadranSeq::do_PcaPlot()`, `BadranSeq::do_UmapPlot()`, `VlnPlot()` |
+
+------------------------------------------------------------------------
+
+# Session Information
+
+-   always include session info for reproducibility
+-   documents R version and all package versions used
+
+```{r session-info}
+sessionInfo()
+```

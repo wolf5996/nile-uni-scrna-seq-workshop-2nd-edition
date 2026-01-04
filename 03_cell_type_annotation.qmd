@@ -1,0 +1,973 @@
+---
+title: "03-Single-Cell RNA-Seq Analysis: Cell Type Annotation"
+author: "Dr Badran Elshenawy"
+date: "January 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: darkly
+    self-contained: true
+    title-block-banner: true
+execute:
+  warning: false
+  message: false
+---
+
+# Introduction
+
+-   this module covers automated cell type annotation methods
+-   we continue from the processed Seurat object created in the QC & Pre-processing module
+-   cell type annotation assigns biological identities to clusters based on gene expression
+-   we'll explore multiple approaches: CyteTypeR (API-based), SingleR (reference-based), GPTCelltype (LLM-based), and manual annotation
+-   each method has strengths and limitations - combining multiple approaches increases confidence
+-   accurate cell type annotation is crucial for biological interpretation of scRNA-seq data
+
+------------------------------------------------------------------------
+
+# Package Installation
+
+-   `CyteTypeR` is an API-driven tool for automated cell type annotation
+-   `SingleR` is the gold standard for reference-based cell type annotation
+-   `celldex` provides curated reference datasets for SingleR
+-   `BadranSeq` provides publication-ready visualizations for single-cell data
+-   `GPTCelltype` uses large language models for marker-based annotation
+-   `conflicted` helps manage function name conflicts between packages
+
+```{r install-packages, eval=FALSE}
+# install BiocManager if not already installed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# install CRAN packages
+install.packages(c(
+  "tidyverse",
+  "Seurat",
+  "devtools",
+  "conflicted",
+  "pheatmap",
+  "tictoc"
+))
+
+# install BadranSeq for publication-ready visualizations
+devtools::install_github("wolf5996/BadranSeq")
+
+# install CyteTypeR for API-based annotation
+devtools::install_github("NygenAnalytics/CyteTypeR")
+
+# install GPTCelltype for LLM-based annotation (optional)
+devtools::install_github("Winnie09/GPTCelltype")
+
+# install Bioconductor packages for reference-based annotation
+BiocManager::install(c(
+  "SingleR",
+  "celldex",
+  "SingleCellExperiment"
+))
+```
+
+------------------------------------------------------------------------
+
+# Directory Structure
+
+-   organizing project files into clear subdirectories makes analyses reproducible and shareable
+-   `read/` stores input data files (raw counts, annotations, metadata)
+-   `write/` stores output files, further organized into `figures/` and `tables/`
+-   `scripts/` contains analysis code (this file lives here)
+-   `checkpoints/` stores intermediate Seurat objects for long-running analyses
+
+```{r setup-directories}
+# create directory structure (safe to run even if directories exist)
+dir.create(
+  "../read",
+  showWarnings = FALSE
+)
+dir.create(
+  "../write",
+  showWarnings = FALSE
+)
+dir.create(
+  "../write/figures",
+  showWarnings = FALSE
+)
+dir.create(
+  "../write/tables",
+  showWarnings = FALSE
+)
+dir.create(
+  "../checkpoints",
+  showWarnings = FALSE
+)
+```
+
+------------------------------------------------------------------------
+
+# Conflict Handling
+
+-   R packages sometimes have functions with the same name (e.g., `filter` in dplyr and stats)
+-   the `conflicted` package makes these conflicts explicit and forces you to choose
+-   `conflicts_prefer()` sets which package's version to use by default
+-   this prevents silent errors from using the wrong function
+
+```{r conflict-setup}
+# packages
+library(conflicted)
+
+# resolve common conflicts
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::rename)
+conflicts_prefer(base::setdiff)
+```
+
+------------------------------------------------------------------------
+
+# 1. Baseline: Original Seurat Annotations
+
+-   the ifnb dataset comes with pre-existing cell type annotations in `seurat_annotations`
+-   these annotations serve as our ground truth for comparing automated methods
+-   first, let's visualize the original annotations to establish a baseline
+
+## 1.1 Load Processed Data
+
+-   load the processed Seurat object from the QC module
+-   examine the available metadata columns
+
+```{r load-data}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load processed Seurat object
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+
+# view metadata columns
+colnames(ifnb_filtered@meta.data)
+
+# preview original annotations
+table(ifnb_filtered$seurat_annotations)
+```
+
+## 1.2 Visualize Original Annotations
+
+-   create a UMAP colored by the original seurat_annotations
+-   this serves as our reference for comparing other methods
+
+```{r baseline-umap, fig.width=10, fig.height=8}
+# packages
+library(tidyverse)
+library(Seurat)
+library(BadranSeq)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+
+# UMAP with original annotations
+BadranSeq::do_UmapPlot(
+  ifnb_filtered,
+  group.by = "seurat_annotations",
+  label = TRUE,
+  plot.title = "Original Seurat Annotations (Baseline)"
+)
+
+# save figure
+ggsave(
+  "../write/figures/umap_original_annotations.png",
+  width = 10,
+  height = 8
+)
+```
+
+------------------------------------------------------------------------
+
+# 2. API-Based Annotation with CyteTypeR
+
+-   CyteTypeR is an API-driven tool for automated cell type annotation
+-   it sends markers, metadata, and UMAP embeddings to the CyteTypeR API
+-   returns annotated Seurat object and interactive HTML report
+-   GitHub: <https://github.com/NygenAnalytics/CyteTypeR>
+-   example report: <https://nygen-labs-prod--cytetype-api.modal.run/report/34fac9e9-3c43-4c46-95f4-6b2994e57ada?cluster=7&tab=markers>
+
+## 2.1 Prepare Data for CyteTypeR
+
+-   CyteTypeR requires cluster markers from FindAllMarkers
+-   we use the markers generated in the DEA module
+-   prepare UMAP coordinates, markers, and metadata for the API
+
+```{r cytetyper-prepare}
+# packages
+library(tidyverse)
+library(Seurat)
+library(CyteTypeR)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+cluster_markers <- read_csv(
+  "../write/tables/ifnb_cluster_markers.csv",
+  show_col_types = FALSE
+)
+
+# convert markers to format expected by CyteTypeR
+cluster_markers_df <- as.data.frame(cluster_markers)
+
+# preview markers
+head(cluster_markers_df)
+
+# prepare data for CyteTypeR API
+prepped_data <- PrepareCyteTypeR(
+  ifnb_filtered,
+  cluster_markers_df,
+  n_top_genes = 10,
+  group_key = "seurat_clusters",
+  aggregate_metadata = TRUE,
+  coordinates_key = "umap"
+)
+
+# preview prepared data structure
+names(prepped_data)
+```
+
+## 2.2 Run CyteTypeR Annotation
+
+-   submit prepared data to the CyteTypeR API
+-   the API returns predicted cell types for each cluster
+-   metadata provides context for the HTML report
+
+```{r cytetyper-run}
+# packages
+library(tidyverse)
+library(Seurat)
+library(CyteTypeR)
+library(tictoc)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+cluster_markers <- read_csv(
+  "../write/tables/ifnb_cluster_markers.csv",
+  show_col_types = FALSE
+)
+
+# prepare data for CyteTypeR
+prepped_data <- PrepareCyteTypeR(
+  ifnb_filtered,
+  as.data.frame(cluster_markers),
+  n_top_genes = 10,
+  group_key = "seurat_clusters",
+  aggregate_metadata = TRUE,
+  coordinates_key = "umap"
+)
+
+# add metadata for the HTML report
+metadata <- list(
+  title = "IFNB scRNA-seq Cell Type Annotation",
+  run_label = "workshop_annotation",
+  experiment_name = "ifnb_stimulation_study"
+)
+
+# run CyteTypeR annotation
+tic("CyteTypeR Run")
+ifnb_annotated <- CyteTypeR(
+  obj = ifnb_filtered,
+  prepped_data = prepped_data,
+  study_context = "PBMC dataset with IFN-beta stimulation from SeuratData package",
+  metadata = metadata
+)
+toc()
+
+# view annotation results
+table(ifnb_annotated$predicted_cell_type)
+
+# save annotated object
+write_rds(
+  ifnb_annotated,
+  "../checkpoints/ifnb_cytetyper_annotated.rds"
+)
+```
+
+# 3. Reference-Based Annotation with SingleR
+
+-   SingleR is the most widely used reference-based annotation method
+-   it compares each cell's expression profile to reference datasets of known cell types
+-   uses Spearman correlation to find the best matching reference cell type
+-   `celldex` package provides curated reference datasets for human and mouse
+-   we'll use Monaco Immune Data - a comprehensive human immune cell reference
+-   note: requires `celldex` package to be installed
+
+## 3.1 Load Reference and Run SingleR
+
+-   Monaco Immune Data contains sorted human immune cell populations
+-   includes 29 cell types from peripheral blood mononuclear cells (PBMCs)
+-   ideal for PBMC datasets like our ifnb data
+-   SingleR annotates each cell individually based on expression similarity
+
+```{r singler-run, eval=FALSE}
+# packages
+library(tidyverse)
+library(Seurat)
+library(SingleR)
+library(celldex)
+library(magrittr)
+
+# load processed Seurat object
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+
+# load Monaco Immune Data reference
+monaco_ref <- MonacoImmuneData()
+
+# view available cell types in reference
+unique(monaco_ref$label.main)
+
+# extract normalized expression matrix (SCT assay)
+expression_matrix <- GetAssayData(
+  ifnb_filtered,
+  assay = "SCT",
+  slot = "data"
+)
+
+# run SingleR with main labels
+singler_results <- SingleR(
+  test = expression_matrix,
+  ref = monaco_ref,
+  labels = monaco_ref$label.main,
+  de.method = "wilcox"
+)
+
+# view annotation summary
+table(singler_results$labels)
+
+# save SingleR results
+write_rds(
+  singler_results,
+  "../checkpoints/singler_results.rds"
+)
+```
+
+## 3.2 Add SingleR Labels to Seurat Object
+
+-   transfer SingleR annotations to Seurat metadata
+-   this allows visualization and downstream analysis with Seurat functions
+
+```{r singler-add-labels, eval=FALSE}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+singler_results <- read_rds("../checkpoints/singler_results.rds")
+
+# add SingleR labels to Seurat metadata
+ifnb_filtered$singler_labels <- singler_results$labels
+
+# add pruned labels (low-confidence assignments set to NA)
+ifnb_filtered$singler_pruned <- singler_results$pruned.labels
+
+# view annotation distribution
+table(ifnb_filtered$singler_labels)
+
+# save updated Seurat object
+write_rds(
+  ifnb_filtered,
+  "../checkpoints/ifnb_singler_annotated.rds"
+)
+```
+
+## 3.3 Visualize SingleR Annotations
+
+-   UMAP colored by SingleR annotations shows the automated cell type assignments
+-   compare with original annotations to assess concordance
+
+```{r singler-umap, eval=FALSE, fig.width=10, fig.height=8}
+# packages
+library(tidyverse)
+library(Seurat)
+library(BadranSeq)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_singler_annotated.rds")
+
+# UMAP by SingleR annotation
+BadranSeq::do_UmapPlot(
+  ifnb_filtered,
+  group.by = "singler_labels",
+  label = TRUE,
+  plot.title = "SingleR Annotation (Monaco Immune Reference)"
+)
+
+# save figure
+ggsave(
+  "../write/figures/umap_singler_annotation.png",
+  width = 10,
+  height = 8
+)
+```
+
+## 3.4 SingleR Quality Assessment
+
+-   SingleR provides quality scores for each annotation
+-   `delta` values indicate confidence - higher is better
+-   heatmap shows correlation scores across cell types
+
+```{r singler-quality, eval=FALSE, fig.width=12, fig.height=8}
+# packages
+library(tidyverse)
+library(SingleR)
+library(pheatmap)
+library(magrittr)
+
+# load data
+singler_results <- read_rds("../checkpoints/singler_results.rds")
+
+# plot score heatmap for first 100 cells
+plotScoreHeatmap(
+  singler_results,
+  cells.use = 1:100,
+  show.labels = TRUE
+)
+
+# plot delta distribution (annotation confidence)
+plotDeltaDistribution(singler_results)
+
+# save delta plot
+ggsave(
+  "../write/figures/singler_delta_distribution.png",
+  width = 10,
+  height = 6
+)
+```
+
+------------------------------------------------------------------------
+
+# 4. LLM-Based Annotation with GPTCelltype
+
+-   GPTCelltype uses large language models to interpret marker genes
+-   it sends cluster marker genes to GPT and receives cell type predictions
+-   requires an OpenAI API key (set as environment variable)
+-   useful when reference datasets don't match your cell types well
+
+## 4.1 Run GPTCelltype Annotation
+
+-   GPTCelltype sends top marker genes to GPT for annotation
+-   `topgenenumber` controls how many markers per cluster to use
+-   requires `OPENAI_API_KEY` environment variable to be set
+-   note: this chunk requires API access and will incur costs
+
+```{r gptcelltype-run, eval=FALSE}
+# packages
+library(tidyverse)
+library(Seurat)
+library(GPTCelltype)
+library(magrittr)
+
+# load data
+cluster_markers <- read_csv(
+  "../write/tables/ifnb_cluster_markers.csv",
+  show_col_types = FALSE
+)
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+
+# run GPTCelltype annotation
+gpt_results <- gptcelltype(
+  input = as.data.frame(cluster_markers),
+  model = "gpt-5",
+  topgenenumber = 50
+)
+
+# view results
+gpt_results
+
+# add GPTCelltype labels to Seurat object
+ifnb_filtered@meta.data$gptcelltype <- gpt_results[as.character(Idents(ifnb_filtered))]
+
+# save updated object
+write_rds(
+  ifnb_filtered,
+  "../checkpoints/ifnb_gpt_annotated.rds"
+)
+```
+
+## 4.2 Visualize GPTCelltype Results
+
+-   compare GPTCelltype annotations with clusters and other methods
+-   note: this chunk only runs if GPTCelltype was executed
+
+```{r gptcelltype-umap, eval=FALSE, fig.width=10, fig.height=8}
+# packages
+library(tidyverse)
+library(Seurat)
+library(BadranSeq)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_gpt_annotated.rds")
+
+# UMAP by GPTCelltype
+BadranSeq::do_UmapPlot(
+  ifnb_filtered,
+  group.by = "gptcelltype",
+  label = TRUE,
+  plot.title = "GPTCelltype Annotation"
+)
+
+# save figure
+ggsave(
+  "../write/figures/umap_gptcelltype_annotation.png",
+  width = 10,
+  height = 8
+)
+```
+
+------------------------------------------------------------------------
+
+# 5. Manual Annotation with Known Markers
+
+-   manual annotation uses known marker genes for cell types
+-   provides gold-standard annotations when markers are well-established
+-   useful for validating automated methods
+-   requires domain knowledge of expected cell types
+
+## 5.1 Define Canonical Markers
+
+-   define marker genes for expected immune cell types
+-   these markers are well-established in the literature
+-   adjust based on your specific tissue/context
+
+```{r manual-markers}
+# packages
+library(tidyverse)
+library(magrittr)
+
+# define canonical immune cell markers
+canonical_markers <- list(
+  "CD14+ Monocytes" = c("CD14", "LYZ", "S100A8", "S100A9"),
+  "CD16+ Monocytes" = c("FCGR3A", "MS4A7", "LST1"),
+  "CD4+ T cells" = c("CD4", "IL7R", "CCR7", "TCF7"),
+  "CD8+ T cells" = c("CD8A", "CD8B", "GZMK", "CCL5"),
+  "NK cells" = c("GNLY", "NKG7", "KLRD1", "NCAM1"),
+  "B cells" = c("CD79A", "MS4A1", "CD19", "IGHM"),
+  "Dendritic cells" = c("FCER1A", "CST3", "CLEC10A"),
+  "Plasmacytoid DC" = c("IL3RA", "TCF4", "LILRA4"),
+  "Platelets" = c("PPBP", "PF4", "GP9")
+)
+
+# convert to dataframe for reference
+markers_df <- tibble(
+  cell_type = names(canonical_markers),
+  markers = map_chr(
+    canonical_markers,
+    ~ paste(.x, collapse = ", ")
+  )
+)
+
+# display markers
+markers_df
+
+# save markers reference
+write_csv(
+  markers_df,
+  "../write/tables/canonical_immune_markers.csv"
+)
+```
+
+## 5.2 Visualize Marker Expression with DotPlot
+
+-   dotplot shows marker expression across clusters
+-   helps identify which clusters express which markers
+-   guides manual annotation decisions
+
+```{r manual-dotplot, fig.width=14, fig.height=8}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+
+# flatten marker list
+all_markers <- c(
+  "CD14", "LYZ", "S100A8",
+  "FCGR3A", "MS4A7",
+  "CD4", "IL7R", "CCR7",
+  "CD8A", "CD8B", "GZMK",
+  "GNLY", "NKG7", "KLRD1",
+  "CD79A", "MS4A1",
+  "FCER1A", "CST3",
+  "PPBP", "PF4"
+)
+
+# filter to markers present in data
+markers_present <- all_markers[all_markers %in% rownames(ifnb_filtered)]
+
+# create dotplot
+DotPlot(
+  ifnb_filtered,
+  features = markers_present,
+  group.by = "seurat_clusters"
+) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(title = "Canonical Marker Expression by Cluster")
+
+# save figure
+ggsave(
+  "../write/figures/marker_dotplot.png",
+  width = 14,
+  height = 8
+)
+```
+
+## 5.3 Feature Plots for Key Markers
+
+-   feature plots show spatial distribution of marker expression on UMAP
+-   helps validate cluster identity visually
+-   compare with cluster structure
+
+```{r manual-featureplot, fig.width=16, fig.height=12}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+
+# key markers for major cell types
+key_markers <- c(
+  "CD14",   # monocytes
+  "CD3E",   # T cells
+  "CD4",    # CD4 T cells
+  "CD8A",   # CD8 T cells
+  "NKG7",   # NK cells
+  "CD79A",  # B cells
+  "FCER1A", # dendritic cells
+  "PPBP"    # platelets
+)
+
+# filter to markers present
+key_markers_present <- key_markers[key_markers %in% rownames(ifnb_filtered)]
+
+# create feature plots
+FeaturePlot(
+  ifnb_filtered,
+  features = key_markers_present,
+  ncol = 4
+)
+
+# save figure
+ggsave(
+  "../write/figures/marker_featureplots.png",
+  width = 16,
+  height = 12
+)
+```
+
+## 5.4 Visualize Clusters for Manual Annotation
+
+-   UMAP colored by clusters shows the groups we would manually annotate
+-   use marker expression patterns to assign cell type labels
+
+```{r clusters-umap, fig.width=10, fig.height=8}
+# packages
+library(tidyverse)
+library(Seurat)
+library(BadranSeq)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+
+# UMAP by cluster (basis for manual annotation)
+BadranSeq::do_UmapPlot(
+  ifnb_filtered,
+  group.by = "seurat_clusters",
+  label = TRUE,
+  plot.title = "Seurat Clusters (For Manual Annotation)"
+)
+
+# save figure
+ggsave(
+  "../write/figures/umap_clusters.png",
+  width = 10,
+  height = 8
+)
+```
+
+------------------------------------------------------------------------
+
+# 6. Annotation Comparison
+
+-   compare annotations from different methods side by side
+-   assess concordance and identify discrepancies
+-   the final comparison shows all methods together
+
+## 6.1 Summary Table
+
+-   create summary of cluster annotations across methods
+-   helps identify consensus and conflicts
+
+```{r annotation-summary}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load data
+ifnb_annotated <- read_rds("../checkpoints/ifnb_cytetyper_annotated.rds")
+
+# create annotation summary by cluster
+annotation_summary <- ifnb_annotated@meta.data %>%
+  group_by(seurat_clusters) %>%
+  summarise(
+    n_cells = n(),
+    original_annotation = names(
+      sort(table(seurat_annotations), decreasing = TRUE)
+    )[1],
+    cytetyper_annotation = names(
+      sort(table(predicted_cell_type), decreasing = TRUE)
+    )[1],
+    .groups = "drop"
+  )
+
+# display summary
+annotation_summary
+
+# save summary
+write_csv(
+  annotation_summary,
+  "../write/tables/annotation_summary.csv"
+)
+```
+
+## 6.2 Confusion Matrix: Original vs CyteTypeR
+
+-   compare CyteTypeR predictions with original labels
+-   high concordance indicates reliable annotation
+
+```{r confusion-matrix, fig.width=10, fig.height=8}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load data
+ifnb_annotated <- read_rds("../checkpoints/ifnb_cytetyper_annotated.rds")
+
+# create confusion matrix
+confusion <- table(
+  Original = ifnb_annotated$seurat_annotations,
+  CyteTypeR = ifnb_annotated$predicted_cell_type
+)
+
+# view confusion matrix
+confusion
+
+# visualize as heatmap
+confusion_df <- as.data.frame(confusion)
+
+ggplot(
+  confusion_df,
+  aes(
+    x = CyteTypeR,
+    y = Original,
+    fill = Freq
+  )
+) +
+  geom_tile() +
+  geom_text(
+    aes(label = Freq),
+    color = "white",
+    size = 3
+  ) +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(
+    title = "CyteTypeR vs Original Annotations",
+    x = "CyteTypeR Prediction",
+    y = "Original Annotation",
+    fill = "Count"
+  )
+
+# save figure
+ggsave(
+  "../write/figures/confusion_matrix.png",
+  width = 10,
+  height = 8
+)
+
+# save confusion matrix table
+write_csv(
+  confusion_df,
+  "../write/tables/confusion_matrix.csv"
+)
+```
+
+## 6.3 Final Comparison: All Annotation Methods
+
+-   side-by-side comparison of original annotations, CyteTypeR, and clusters
+-   this is the key output showing how different methods compare
+
+```{r final-comparison, fig.width=18, fig.height=6}
+# packages
+library(tidyverse)
+library(Seurat)
+library(BadranSeq)
+library(patchwork)
+library(magrittr)
+
+# load data
+ifnb_annotated <- read_rds("../checkpoints/ifnb_cytetyper_annotated.rds")
+
+# UMAP by original annotations (ground truth)
+p1 <- BadranSeq::do_UmapPlot(
+  ifnb_annotated,
+  group.by = "seurat_annotations",
+  label = TRUE,
+  plot.title = "Original Annotations"
+)
+
+# UMAP by CyteTypeR annotation
+p2 <- BadranSeq::do_UmapPlot(
+  ifnb_annotated,
+  group.by = "predicted_cell_type",
+  label = TRUE,
+  plot.title = "CyteTypeR Annotation"
+)
+
+# UMAP by clusters
+p3 <- BadranSeq::do_UmapPlot(
+  ifnb_annotated,
+  group.by = "seurat_clusters",
+  label = TRUE,
+  plot.title = "Seurat Clusters"
+)
+
+# combine all three plots
+p1 + p2 + p3
+
+# save combined figure
+ggsave(
+  "../write/figures/annotation_comparison.png",
+  width = 18,
+  height = 6
+)
+```
+
+## 6.4 Cell Type Proportions by Condition
+
+-   compare cell type proportions between conditions
+-   bar plots show compositional differences
+
+```{r cell-proportions, fig.width=12, fig.height=6}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load data
+ifnb_annotated <- read_rds("../checkpoints/ifnb_cytetyper_annotated.rds")
+
+# calculate proportions using original annotations
+proportions <- ifnb_annotated@meta.data %>%
+  group_by(stim, seurat_annotations) %>%
+  summarise(
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(stim) %>%
+  mutate(
+    proportion = n / sum(n)
+  )
+
+# bar plot of proportions
+ggplot(
+  proportions,
+  aes(
+    x = seurat_annotations,
+    y = proportion,
+    fill = stim
+  )
+) +
+  geom_bar(
+    stat = "identity",
+    position = "dodge"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(
+    title = "Cell Type Proportions by Condition",
+    x = "Cell Type",
+    y = "Proportion",
+    fill = "Condition"
+  ) +
+  scale_fill_brewer(palette = "Set1")
+
+# save figure
+ggsave(
+  "../write/figures/celltype_proportions.png",
+  width = 12,
+  height = 6
+)
+
+# save proportions table
+write_csv(
+  proportions,
+  "../write/tables/celltype_proportions.csv"
+)
+```
+
+------------------------------------------------------------------------
+
+# Summary
+
+-   we performed cell type annotation using multiple approaches
+-   original `seurat_annotations` served as our ground truth baseline
+-   CyteTypeR provided API-based automated annotation with interactive reports
+-   SingleR offers reference-based annotations using curated datasets (requires celldex)
+-   GPTCelltype enables LLM-based annotation (requires API key)
+-   manual annotation using canonical markers validated automated results
+-   the final comparison figure shows all methods side by side
+
+| Method      | Approach        | Key Functions                         |
+|-------------|-----------------|---------------------------------------|
+| Original    | Pre-annotated   | `seurat_annotations` metadata         |
+| CyteTypeR   | API-based       | `PrepareCyteTypeR()`, `CyteTypeR()`   |
+| SingleR     | Reference-based | `SingleR()`, `MonacoImmuneData()`     |
+| GPTCelltype | LLM-based       | `gptcelltype()` (optional)            |
+| Manual      | Marker-based    | `DotPlot()`, `FeaturePlot()`          |
+| Comparison  | Multi-method    | `BadranSeq::do_UmapPlot()`, `table()` |
+
+------------------------------------------------------------------------
+
+# Session Information
+
+-   always include session info for reproducibility
+-   documents R version and all package versions used
+
+```{r session-info}
+sessionInfo()
+```

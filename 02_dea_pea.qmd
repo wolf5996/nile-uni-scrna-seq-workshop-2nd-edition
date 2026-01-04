@@ -1,0 +1,845 @@
+---
+title: "02-Single-Cell RNA-Seq Analysis: DEA & PEA"
+author: "Dr Badran Elshenawy"
+date: "January 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: darkly
+    self-contained: true
+    title-block-banner: true
+execute:
+  warning: false
+  message: false
+---
+
+# Introduction
+
+-   this module covers differential expression analysis (DEA) and pathway enrichment analysis (PEA)
+-   we continue from the processed Seurat object created in the QC & Pre-processing module
+-   DEA identifies genes differentially expressed between clusters or conditions
+-   PEA reveals biological pathways and processes enriched in our gene lists
+-   we'll use both ORA (over-representation analysis) and GSEA (gene set enrichment analysis)
+-   for simplicity, we focus on a single cluster (cluster 0) throughout this tutorial
+
+------------------------------------------------------------------------
+
+# Package Installation
+
+-   `clusterProfiler` is the gold standard for pathway enrichment analysis in R
+-   `org.Hs.eg.db` provides human gene annotations for mapping gene symbols to Entrez IDs
+-   `enrichplot` provides visualization functions for enrichment results
+-   `DOSE` provides disease ontology analysis capabilities
+-   `BadranSeq` provides publication-ready visualizations for single-cell data
+-   `conflicted` helps manage function name conflicts between packages
+
+```{r install-packages, eval=FALSE}
+# install BiocManager if not already installed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# install CRAN packages
+install.packages(c(
+  "tidyverse",
+  "Seurat",
+  "devtools",
+  "conflicted"
+))
+
+# install BadranSeq for publication-ready visualizations
+devtools::install_github("wolf5996/BadranSeq")
+
+# install Bioconductor packages for pathway analysis
+BiocManager::install(c(
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "enrichplot",
+  "DOSE"
+))
+```
+
+------------------------------------------------------------------------
+
+# Directory Structure
+
+-   organizing project files into clear subdirectories makes analyses reproducible and shareable
+-   `read/` stores input data files (raw counts, annotations, metadata)
+-   `write/` stores output files, further organized into `figures/` and `tables/`
+-   `scripts/` contains analysis code (this file lives here)
+-   `checkpoints/` stores intermediate Seurat objects for long-running analyses
+
+```{r setup-directories}
+# create directory structure (safe to run even if directories exist)
+dir.create(
+  "../read",
+  showWarnings = FALSE
+)
+dir.create(
+  "../write",
+  showWarnings = FALSE
+)
+dir.create(
+  "../write/figures",
+  showWarnings = FALSE
+)
+dir.create(
+  "../write/tables",
+  showWarnings = FALSE
+)
+dir.create(
+  "../checkpoints",
+  showWarnings = FALSE
+)
+```
+
+------------------------------------------------------------------------
+
+# Conflict Handling
+
+-   R packages sometimes have functions with the same name (e.g., `filter` in dplyr and stats)
+-   the `conflicted` package makes these conflicts explicit and forces you to choose
+-   `conflicts_prefer()` sets which package's version to use by default
+-   this prevents silent errors from using the wrong function
+
+```{r conflict-setup}
+# packages
+library(conflicted)
+
+# resolve common conflicts
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::rename)
+conflicts_prefer(base::setdiff)
+```
+
+------------------------------------------------------------------------
+
+# 1. Differential Expression Analysis (DEA)
+
+-   DEA identifies genes with significant expression differences between groups
+-   Seurat's `FindAllMarkers()` compares each cluster against all others
+-   we use the Wilcoxon rank-sum test (default) for statistical testing
+-   `min.pct` filters genes expressed in fewer than 20% of cells
+-   `logfc.threshold` filters genes with small fold changes
+
+## 1.1 Find Cluster Markers
+
+-   identify marker genes for each cluster
+-   these genes distinguish each cluster from all other cells
+
+```{r dea-cluster-markers}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+
+# verify cluster identities are set correctly
+all(Idents(ifnb_filtered) == ifnb_filtered$seurat_clusters)
+
+# find markers for all clusters
+cluster_markers <- FindAllMarkers(
+  object = ifnb_filtered,
+  min.pct = 0.2,
+  logfc.threshold = 0.2,
+  verbose = FALSE
+)
+
+# preview results
+cluster_markers %>%
+  head(20)
+
+# save results
+write_csv(
+  x = cluster_markers,
+  file = "../write/tables/ifnb_cluster_markers.csv"
+)
+```
+
+## 1.2 Top Markers Per Cluster
+
+-   extract top markers for each cluster by log2 fold change
+-   these are the most distinctive genes for each cluster
+
+```{r dea-top-markers}
+# packages
+library(tidyverse)
+library(magrittr)
+
+# load data
+cluster_markers <- read_csv(
+  "../write/tables/ifnb_cluster_markers.csv",
+  show_col_types = FALSE
+)
+
+# get top 10 markers per cluster
+top_markers <- cluster_markers %>%
+  group_by(cluster) %>%
+  top_n(
+    n = 10,
+    wt = avg_log2FC
+  ) %>%
+  arrange(
+    cluster,
+    desc(avg_log2FC)
+  )
+
+# display top markers
+top_markers %>%
+  select(
+    cluster,
+    gene,
+    avg_log2FC,
+    p_val_adj
+  )
+
+# save results
+write_csv(
+  x = top_markers,
+  file = "../write/tables/ifnb_top_markers.csv"
+)
+```
+
+## 1.3 Visualize Markers
+
+-   heatmap shows expression patterns of top markers across clusters
+-   helps validate that markers are cluster-specific
+
+```{r dea-heatmap, fig.width=14, fig.height=12}
+# packages
+library(tidyverse)
+library(Seurat)
+library(magrittr)
+
+# load data
+ifnb_filtered <- read_rds("../checkpoints/ifnb_processed.rds")
+cluster_markers <- read_csv(
+  "../write/tables/ifnb_cluster_markers.csv",
+  show_col_types = FALSE
+)
+
+# get top 5 markers per cluster for heatmap
+heatmap_genes <- cluster_markers %>%
+  group_by(cluster) %>%
+  top_n(
+    n = 5,
+    wt = avg_log2FC
+  ) %>%
+  pull(gene) %>%
+  unique()
+
+# create heatmap
+DoHeatmap(
+  object = ifnb_filtered,
+  features = heatmap_genes,
+  group.by = "seurat_clusters",
+  slot = "data"
+) +
+  theme(
+    axis.text.y = element_text(size = 6)
+  )
+
+# save figure
+ggsave(
+  "../write/figures/dea_heatmap.png",
+  width = 14,
+  height = 12
+)
+```
+
+------------------------------------------------------------------------
+
+# 2. Pathway Enrichment Analysis (PEA)
+
+-   PEA identifies biological pathways and processes enriched in gene lists
+-   two main approaches: ORA and GSEA
+-   ORA tests if pathway genes are over-represented in a gene list
+-   GSEA tests if pathway genes are enriched at the top/bottom of a ranked list
+-   we'll perform both GO (Gene Ontology) and KEGG pathway analyses
+-   we focus on cluster 0 as an example - you can change the cluster number to analyze others
+
+------------------------------------------------------------------------
+
+# 3. Over-Representation Analysis (ORA)
+
+-   ORA uses a hypergeometric test to find enriched pathways
+-   input: list of significant genes (e.g., upregulated markers)
+-   tests whether pathway genes appear more often than expected by chance
+
+## 3.1 Extract Cluster 0 Markers
+
+-   filter marker genes for cluster 0 only
+-   focus on upregulated genes (positive log2FC)
+
+```{r ora-cluster0-markers}
+# packages
+library(tidyverse)
+library(magrittr)
+
+# load data
+cluster_markers <- read_csv(
+  "../write/tables/ifnb_cluster_markers.csv",
+  show_col_types = FALSE
+)
+
+# filter for cluster 0 upregulated genes
+cluster0_markers <- cluster_markers %>%
+  filter(
+    cluster == 0,
+    avg_log2FC > 0
+  )
+
+# preview
+cluster0_markers %>%
+  head(20)
+
+# extract gene list for ORA
+cluster0_genes <- cluster0_markers %>%
+  pull(gene)
+
+# show number of genes
+paste(
+  "Number of upregulated genes in cluster 0:",
+  length(cluster0_genes)
+)
+
+# save cluster 0 markers
+write_csv(
+  x = cluster0_markers,
+  file = "../write/tables/cluster0_markers.csv"
+)
+```
+
+## 3.2 GO ORA (Biological Process)
+
+-   Gene Ontology describes gene functions in three domains: BP, MF, CC
+-   BP (Biological Process) describes cellular processes genes are involved in
+-   we test if cluster 0 marker genes are enriched in specific biological processes
+
+```{r ora-go, fig.width=12, fig.height=8}
+# packages
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(magrittr)
+
+# load data
+cluster0_markers <- read_csv(
+  "../write/tables/cluster0_markers.csv",
+  show_col_types = FALSE
+)
+
+# extract gene list
+cluster0_genes <- cluster0_markers %>%
+  pull(gene)
+
+# perform GO enrichment for biological process
+go_ora_result <- enrichGO(
+  gene = cluster0_genes,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+# preview results
+go_ora_result@result %>%
+  head(10) %>%
+  select(
+    Description,
+    GeneRatio,
+    pvalue,
+    p.adjust
+  )
+
+# visualize with dotplot
+dotplot(
+  go_ora_result,
+  showCategory = 15
+) +
+  ggtitle("GO Biological Process ORA - Cluster 0") +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# save figure
+ggsave(
+  "../write/figures/go_ora_cluster0.png",
+  width = 12,
+  height = 8
+)
+
+# save results table
+write_csv(
+  x = go_ora_result@result,
+  file = "../write/tables/go_ora_cluster0.csv"
+)
+
+# save full results object
+write_rds(
+  go_ora_result,
+  "../checkpoints/go_ora_cluster0.rds"
+)
+```
+
+## 3.3 KEGG ORA
+
+-   KEGG (Kyoto Encyclopedia of Genes and Genomes) contains curated pathway maps
+-   requires Entrez IDs rather than gene symbols
+-   we first convert gene symbols to Entrez IDs
+
+```{r ora-kegg, fig.width=12, fig.height=8}
+# packages
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(magrittr)
+
+# load data
+cluster0_markers <- read_csv(
+  "../write/tables/cluster0_markers.csv",
+  show_col_types = FALSE
+)
+
+# extract gene list
+cluster0_genes <- cluster0_markers %>%
+  pull(gene)
+
+# convert gene symbols to Entrez IDs
+gene_entrez <- bitr(
+  cluster0_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+# show conversion results
+paste(
+  "Converted",
+  nrow(gene_entrez),
+  "of",
+  length(cluster0_genes),
+  "genes to Entrez IDs"
+)
+
+# perform KEGG enrichment
+kegg_ora_result <- enrichKEGG(
+  gene = gene_entrez$ENTREZID,
+  organism = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+
+# preview results
+kegg_ora_result@result %>%
+  head(10) %>%
+  select(
+    Description,
+    GeneRatio,
+    pvalue,
+    p.adjust
+  )
+
+# visualize with dotplot
+dotplot(
+  kegg_ora_result,
+  showCategory = 15
+) +
+  ggtitle("KEGG Pathway ORA - Cluster 0") +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# save figure
+ggsave(
+  "../write/figures/kegg_ora_cluster0.png",
+  width = 12,
+  height = 8
+)
+
+# save results table
+write_csv(
+  x = kegg_ora_result@result,
+  file = "../write/tables/kegg_ora_cluster0.csv"
+)
+
+# save full results object
+write_rds(
+  kegg_ora_result,
+  "../checkpoints/kegg_ora_cluster0.rds"
+)
+```
+
+------------------------------------------------------------------------
+
+# 4. Gene Set Enrichment Analysis (GSEA)
+
+-   GSEA uses the full ranked gene list, not just significant genes
+-   tests if pathway genes are enriched at extremes of the ranking
+-   more sensitive than ORA as it uses all gene information
+-   ranking based on log2FC captures both up and down-regulated pathways
+
+## 4.1 Prepare Ranked Gene List
+
+-   create ranked gene list for GSEA
+-   genes ranked by log2 fold change (positive = upregulated)
+-   use ALL genes from cluster 0, not just upregulated
+
+```{r gsea-prepare}
+# packages
+library(tidyverse)
+library(magrittr)
+
+# load data
+cluster_markers <- read_csv(
+  "../write/tables/ifnb_cluster_markers.csv",
+  show_col_types = FALSE
+)
+
+# get ALL cluster 0 markers (both up and down regulated)
+cluster0_all <- cluster_markers %>%
+  filter(cluster == 0)
+
+# create ranked gene list (named vector)
+ranked_genes <- cluster0_all %>%
+  arrange(desc(avg_log2FC)) %>%
+  select(
+    gene,
+    avg_log2FC
+  ) %>%
+  deframe()
+
+# preview top and bottom of ranked list
+head(ranked_genes, 10)
+tail(ranked_genes, 10)
+
+# show total genes
+paste(
+  "Total genes in ranked list:",
+  length(ranked_genes)
+)
+
+# save ranked list
+write_rds(
+  ranked_genes,
+  "../checkpoints/cluster0_ranked_genes.rds"
+)
+```
+
+## 4.2 GO GSEA (Biological Process)
+
+-   GSEA on Gene Ontology Biological Process terms
+-   identifies pathways enriched in up or down-regulated genes
+
+```{r gsea-go, fig.width=12, fig.height=8}
+# packages
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(magrittr)
+
+# load data
+ranked_genes <- read_rds("../checkpoints/cluster0_ranked_genes.rds")
+
+# perform GO GSEA
+go_gsea_result <- gseGO(
+  geneList = ranked_genes,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  verbose = FALSE,
+  eps = 0
+)
+
+# preview results
+go_gsea_result@result %>%
+  head(10) %>%
+  select(
+    Description,
+    NES,
+    pvalue,
+    p.adjust
+  )
+
+# visualize with dotplot (split by activated/suppressed)
+dotplot(
+  go_gsea_result,
+  showCategory = 15,
+  split = ".sign"
+) +
+  facet_grid(. ~ .sign) +
+  ggtitle("GO Biological Process GSEA - Cluster 0") +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# save figure
+ggsave(
+  "../write/figures/go_gsea_cluster0.png",
+  width = 12,
+  height = 8
+)
+
+# save results table
+write_csv(
+  x = go_gsea_result@result,
+  file = "../write/tables/go_gsea_cluster0.csv"
+)
+
+# save full results object
+write_rds(
+  go_gsea_result,
+  "../checkpoints/go_gsea_cluster0.rds"
+)
+```
+
+## 4.3 Prepare Entrez Ranked List for KEGG
+
+-   KEGG requires Entrez IDs rather than gene symbols
+-   convert gene symbols to Entrez IDs while preserving ranking
+
+```{r gsea-kegg-prepare}
+# packages
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(magrittr)
+
+# load data
+cluster_markers <- read_csv(
+  "../write/tables/ifnb_cluster_markers.csv",
+  show_col_types = FALSE
+)
+
+# get ALL cluster 0 markers
+cluster0_all <- cluster_markers %>%
+  filter(cluster == 0)
+
+# convert gene symbols to Entrez IDs
+gene_mapping <- bitr(
+  cluster0_all$gene,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+# merge with log2FC values and create ranked list
+entrez_ranked <- cluster0_all %>%
+  inner_join(
+    gene_mapping,
+    by = c("gene" = "SYMBOL")
+  ) %>%
+  arrange(desc(avg_log2FC)) %>%
+  select(
+    ENTREZID,
+    avg_log2FC
+  ) %>%
+  distinct(
+    ENTREZID,
+    .keep_all = TRUE
+  ) %>%
+  deframe()
+
+# preview
+head(entrez_ranked, 10)
+
+# show conversion results
+paste(
+  "Genes in Entrez ranked list:",
+  length(entrez_ranked)
+)
+
+# save Entrez ranked list
+write_rds(
+  entrez_ranked,
+  "../checkpoints/cluster0_entrez_ranked.rds"
+)
+```
+
+## 4.4 KEGG GSEA
+
+-   GSEA on KEGG pathways
+-   uses Entrez ID ranked list prepared in previous chunk
+
+```{r gsea-kegg, fig.width=12, fig.height=8}
+# packages
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(magrittr)
+
+# load data
+entrez_ranked <- read_rds("../checkpoints/cluster0_entrez_ranked.rds")
+
+# perform KEGG GSEA
+kegg_gsea_result <- gseKEGG(
+  geneList = entrez_ranked,
+  organism = "hsa",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  verbose = FALSE,
+  eps = 0
+)
+
+# preview results
+kegg_gsea_result@result %>%
+  head(10) %>%
+  select(
+    Description,
+    NES,
+    pvalue,
+    p.adjust
+  )
+
+# visualize with dotplot (split by activated/suppressed)
+dotplot(
+  kegg_gsea_result,
+  showCategory = 15,
+  split = ".sign"
+) +
+  facet_grid(. ~ .sign) +
+  ggtitle("KEGG Pathway GSEA - Cluster 0") +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# save figure
+ggsave(
+  "../write/figures/kegg_gsea_cluster0.png",
+  width = 12,
+  height = 8
+)
+
+# save results table
+write_csv(
+  x = kegg_gsea_result@result,
+  file = "../write/tables/kegg_gsea_cluster0.csv"
+)
+
+# save full results object
+write_rds(
+  kegg_gsea_result,
+  "../checkpoints/kegg_gsea_cluster0.rds"
+)
+```
+
+## 4.5 GSEA Enrichment Plot - GO
+
+-   enrichment plots show running enrichment score along ranked gene list
+-   visualize how pathway genes are distributed in the ranking
+
+```{r gsea-enrichment-go, fig.width=10, fig.height=6}
+# packages
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(magrittr)
+
+# load data
+go_gsea_result <- read_rds("../checkpoints/go_gsea_cluster0.rds")
+
+# get top GO term
+top_go_term <- go_gsea_result@result$ID[1]
+top_go_description <- go_gsea_result@result$Description[1]
+
+# create enrichment plot
+gseaplot2(
+  go_gsea_result,
+  geneSetID = top_go_term,
+  title = paste(
+    "GSEA Enrichment Plot -",
+    top_go_description
+  )
+)
+
+# save figure
+ggsave(
+  "../write/figures/gsea_enrichment_go_cluster0.png",
+  width = 10,
+  height = 6
+)
+```
+
+## 4.6 GSEA Enrichment Plot - KEGG
+
+-   enrichment plot for top KEGG pathway
+-   shows running score and gene distribution
+
+```{r gsea-enrichment-kegg, fig.width=10, fig.height=6}
+# packages
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(magrittr)
+
+# load data
+kegg_gsea_result <- read_rds("../checkpoints/kegg_gsea_cluster0.rds")
+
+# get top KEGG term
+top_kegg_term <- kegg_gsea_result@result$ID[1]
+top_kegg_description <- kegg_gsea_result@result$Description[1]
+
+# create enrichment plot
+gseaplot2(
+  kegg_gsea_result,
+  geneSetID = top_kegg_term,
+  title = paste(
+    "GSEA Enrichment Plot -",
+    top_kegg_description
+  )
+)
+
+# save figure
+ggsave(
+  "../write/figures/gsea_enrichment_kegg_cluster0.png",
+  width = 10,
+  height = 6
+)
+```
+
+------------------------------------------------------------------------
+
+# Summary
+
+-   we performed differential expression analysis to identify cluster marker genes
+-   focused on cluster 0 for pathway enrichment analysis
+-   over-representation analysis (ORA) identified enriched GO terms and KEGG pathways
+-   gene set enrichment analysis (GSEA) provided a more sensitive pathway analysis
+-   results saved as CSV files and visualizations for further interpretation
+-   to analyze other clusters, simply change `cluster == 0` to your cluster of interest
+
+| Analysis  | Method             | Key Functions                     |
+|-----------|--------------------|-----------------------------------|
+| DEA       | Wilcoxon           | `FindAllMarkers()`, `DoHeatmap()` |
+| GO ORA    | Hypergeometric     | `enrichGO()`, `dotplot()`         |
+| KEGG ORA  | Hypergeometric     | `enrichKEGG()`, `dotplot()`       |
+| GO GSEA   | Kolmogorov-Smirnov | `gseGO()`, `gseaplot2()`          |
+| KEGG GSEA | Kolmogorov-Smirnov | `gseKEGG()`, `gseaplot2()`        |
+
+------------------------------------------------------------------------
+
+# Session Information
+
+-   always include session info for reproducibility
+-   documents R version and all package versions used
+
+```{r session-info}
+sessionInfo()
+```
